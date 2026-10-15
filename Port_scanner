@@ -1,21 +1,253 @@
+#!/usr/bin/env python3
+"""port_scanner -- a small TCP connect scanner for your own machines.
+
+One of the first things I wrote while teaching myself networking
+(May 2026). The original asked for an IP address and tried 11 ports one
+at a time, printing the open ones. This is the updated version of the
+same idea:
+
+* Threaded (up to 32 workers) instead of strictly sequential -- a closed
+  or firewalled host no longer costs a full second per port, serially.
+* 25 well-known ports, each with its service name (the original's 11
+  are all still in there).
+* Open / closed / filtered are reported as three distinct states. The
+  original only printed open ports, but closed (connection refused) and
+  filtered (silence / timeout) are different answers.
+* Optional passive banner grab (``--banner``): reads the banner a
+  service volunteers, or sends a harmless HTTP HEAD probe on web ports.
+  That's all it does -- there are deliberately no exploitation features.
+* Friendly input validation: empty targets, unresolvable hostnames and
+  CIDR ranges get a plain-English explanation instead of a traceback.
+
+Usage:
+    python3 port_scanner [target] [--banner] [--timeout 1.0]
+
+    target    an IP address or hostname (you'll be asked if omitted)
+    --banner  also grab service banners on open ports
+    --timeout per-port timeout in seconds (default: 1.0)
+
+Standard library only -- no dependencies.
+
+AUTHORIZED USE: only scan systems you own or have explicit permission
+to test. Scanning other people's systems without permission may be
+illegal and is not what this tool is for. Start with 127.0.0.1 -- your
+own machine is the intended target.
+
+This script grew up into a full desktop app -- see the QuantumCat SOC
+Toolkit at https://quantumcatsoc.gumroad.com/l/quantumcat-soc-toolkit
+"""
+
+from __future__ import annotations
+
+import errno
 import socket
+import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
+from typing import Dict, Iterable, List, Optional
 
-target = input("Enter target IP: ")
+AUTHORIZED_USE_NOTE = (
+    "Only scan systems you own or have explicit permission to test. "
+    "Scanning other people's systems without permission may be illegal "
+    "and is not what this tool is for."
+)
 
-ports = [21, 22, 23, 25, 53, 80, 135, 139, 443, 445, 3389]
+# 25 well-known TCP ports, each with its usual service. The original's
+# 11 ports (21, 22, 23, 25, 53, 80, 135, 139, 443, 445, 3389) included.
+COMMON_PORTS: Dict[int, str] = {
+    21: "FTP",
+    22: "SSH",
+    23: "Telnet",
+    25: "SMTP",
+    53: "DNS",
+    80: "HTTP",
+    110: "POP3",
+    111: "RPCbind",
+    135: "MS-RPC",
+    139: "NetBIOS",
+    143: "IMAP",
+    443: "HTTPS",
+    445: "SMB",
+    465: "SMTPS",
+    587: "SMTP Submission",
+    993: "IMAPS",
+    995: "POP3S",
+    1723: "PPTP",
+    3306: "MySQL",
+    3389: "RDP",
+    5432: "PostgreSQL",
+    5900: "VNC",
+    8000: "HTTP-Alt",
+    8080: "HTTP-Proxy/Alt",
+    8443: "HTTPS-Alt",
+}
 
-print(f"\n[+] Scanning {target}\n")
+# Ports where a plain HTTP HEAD probe is a reasonable banner request.
+_HTTP_PORTS = {80, 8000, 8080}
 
-for port in ports:
 
+@dataclass
+class ScanResult:
+    port: int
+    service: str
+    status: str  # "open" | "closed" | "filtered"
+    banner: str = ""
+
+
+def validate_target(raw: str) -> tuple:
+    """Validate and resolve a scan target.
+
+    Returns ``(ip_address, display_name)``. Raises ValueError with a
+    friendly, user-facing message for anything unusable.
+    """
+    target = (raw or "").strip()
+    if not target:
+        raise ValueError(
+            "Enter a target first -- an IP address or hostname, e.g. 127.0.0.1"
+        )
+    if "/" in target:
+        raise ValueError(
+            "That looks like a network range (CIDR). This scanner does one "
+            "host at a time -- enter a single IP address or hostname."
+        )
+    if " " in target:
+        raise ValueError(
+            "That target contains spaces -- enter a single IP address or hostname."
+        )
+    try:
+        ip = socket.gethostbyname(target)
+    except socket.gaierror:
+        raise ValueError(
+            f"Could not resolve '{target}'. Check the spelling, or use an IP address."
+        ) from None
+    except UnicodeError:
+        raise ValueError(f"'{target}' is not a valid hostname or IP address.") from None
+    return ip, target
+
+
+def _grab_banner(sock: socket.socket, port: int) -> str:
+    """Best-effort, passive banner read from an already-connected socket."""
+    try:
+        sock.settimeout(1.5)
+        try:
+            data = sock.recv(1024)
+        except socket.timeout:
+            if port in _HTTP_PORTS:
+                sock.sendall(b"HEAD / HTTP/1.0\r\n\r\n")
+                data = sock.recv(1024)
+            else:
+                return ""
+        text = data.decode("utf-8", errors="replace").strip()
+        # Keep the first meaningful line, trimmed for display.
+        first = text.splitlines()[0].strip() if text else ""
+        return first[:120]
+    except OSError:
+        return ""
+
+
+def scan_port(
+    ip: str, port: int, timeout: float = 1.0, banner: bool = False
+) -> ScanResult:
+    """Connect-scan one port; classify it open / closed / filtered."""
+    service = COMMON_PORTS.get(port, "unknown")
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(1)
+    sock.settimeout(timeout)
+    try:
+        result = sock.connect_ex((ip, port))
+        if result == 0:
+            grabbed = _grab_banner(sock, port) if banner else ""
+            return ScanResult(port=port, service=service, status="open", banner=grabbed)
+        if result == errno.ECONNREFUSED:
+            return ScanResult(port=port, service=service, status="closed")
+        return ScanResult(port=port, service=service, status="filtered")
+    except (socket.timeout, TimeoutError):
+        return ScanResult(port=port, service=service, status="filtered")
+    except OSError:
+        return ScanResult(port=port, service=service, status="filtered")
+    finally:
+        sock.close()
 
-    result = sock.connect_ex((target, port))
 
-    if result == 0:
-        print(f"[OPEN] Port {port}")
+def scan_host(
+    target: str,
+    ports: Optional[Iterable[int]] = None,
+    timeout: float = 1.0,
+    banner: bool = False,
+    workers: int = 32,
+) -> tuple:
+    """Scan one host. Returns ``(ip, display_name, results sorted by port)``."""
+    ip, display = validate_target(target)
+    port_list = sorted(set(ports)) if ports is not None else sorted(COMMON_PORTS)
+    results: List[ScanResult] = []
 
-    sock.close()
+    def _job(p: int) -> ScanResult:
+        return scan_port(ip, p, timeout=timeout, banner=banner)
 
-print("\n[+] Scan complete.")
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        futures = {pool.submit(_job, p): p for p in port_list}
+        for future in as_completed(futures):
+            try:
+                results.append(future.result())
+            except Exception:
+                continue
+    results.sort(key=lambda r: r.port)
+    return ip, display, results
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    banner = "--banner" in argv
+    argv = [a for a in argv if a != "--banner"]
+    timeout = 1.0
+    if "--timeout" in argv:
+        idx = argv.index("--timeout")
+        try:
+            timeout = float(argv[idx + 1])
+            del argv[idx : idx + 2]
+        except (IndexError, ValueError):
+            print("Usage: port_scanner [target] [--banner] [--timeout SECONDS]")
+            return 2
+    if any(a.startswith("--") for a in argv) or len(argv) > 1:
+        print("Usage: port_scanner [target] [--banner] [--timeout SECONDS]")
+        return 2
+
+    print("QuantumCat port scanner -- a learning tool for your own machines.")
+    print(f"[!] {AUTHORIZED_USE_NOTE}")
+
+    target = argv[0] if argv else ""
+    if not target:
+        try:
+            target = input("\nEnter target IP or hostname: ")
+        except (EOFError, KeyboardInterrupt):
+            print("\nNo target given -- nothing to scan.")
+            return 1
+
+    try:
+        ip, display, results = scan_host(target, timeout=timeout, banner=banner)
+    except ValueError as exc:
+        print(f"\n[!] {exc}")
+        return 1
+
+    shown = display if display == ip else f"{display} ({ip})"
+    print(f"\n[+] Scanning {shown} -- {len(results)} ports\n")
+
+    counts = {"open": 0, "closed": 0, "filtered": 0}
+    for r in results:
+        counts[r.status] += 1
+        if r.status == "open":
+            line = f"[OPEN]     Port {r.port:<5} {r.service}"
+            if r.banner:
+                line += f"  -- {r.banner}"
+            print(line)
+        else:
+            print(f"[{r.status.upper():<8}] Port {r.port:<5} {r.service}")
+
+    print(
+        f"\n[+] Scan complete: {counts['open']} open, "
+        f"{counts['closed']} closed, {counts['filtered']} filtered."
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
