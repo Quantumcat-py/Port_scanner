@@ -4,27 +4,39 @@
 One of the first things I wrote while teaching myself networking
 (May 2026). The original asked for an IP address and tried 11 ports one
 at a time, printing the open ones. This is the updated version of the
-same idea:
+same idea. What the previous update added:
 
 * Threaded (up to 32 workers) instead of strictly sequential -- a closed
   or firewalled host no longer costs a full second per port, serially.
 * 25 well-known ports, each with its service name (the original's 11
   are all still in there).
-* Open / closed / filtered are reported as three distinct states. The
-  original only printed open ports, but closed (connection refused) and
-  filtered (silence / timeout) are different answers.
-* Optional passive banner grab (``--banner``): reads the banner a
-  service volunteers, or sends a harmless HTTP HEAD probe on web ports.
-  That's all it does -- there are deliberately no exploitation features.
-* Friendly input validation: empty targets, unresolvable hostnames and
-  CIDR ranges get a plain-English explanation instead of a traceback.
+* Open / closed / filtered reported as three distinct states.
+
+What this update (v1.2) adds:
+
+* Scan profiles: ``--profile quick`` is the original 25 ports;
+  ``standard`` is a curated Top-100; ``deep`` is a Top-1000. A bigger
+  service-name table (~285 well-known assignments) names what the
+  wider profiles find.
+* Better accuracy: a port that stays silent (a "filtered" verdict) is
+  retried once at a longer timeout (2 seconds) before the label is
+  final -- one 1-second pass mislabels slow or firewalled services.
+  Every line now shows the connect latency in milliseconds, so a fast
+  refusal reads differently from a slow one.
+* Open ports on the risky list (SMB, RDP, Docker's unauthenticated
+  API, Redis, ...) are called out with a plain-English reason.
+* Banner probing covers the usual web-alt ports (80, 8000, 8080,
+  8888, 9000). TLS ports are never sent a plaintext probe -- only a
+  banner the service volunteers is read there.
 
 Usage:
     python3 port_scanner [target] [--banner] [--timeout 1.0]
+                         [--profile quick|standard|deep]
 
     target    an IP address or hostname (you'll be asked if omitted)
     --banner  also grab service banners on open ports
     --timeout per-port timeout in seconds (default: 1.0)
+    --profile which port set to scan (default: quick, the original 25)
 
 Standard library only -- no dependencies.
 
@@ -42,6 +54,7 @@ from __future__ import annotations
 import errno
 import socket
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional
@@ -52,8 +65,34 @@ AUTHORIZED_USE_NOTE = (
     "and is not what this tool is for."
 )
 
-# 25 well-known TCP ports, each with its usual service. The original's
-# 11 ports (21, 22, 23, 25, 53, 80, 135, 139, 443, 445, 3389) included.
+# Ports where a plain HTTP HEAD probe is a reasonable banner request.
+# Plaintext-HTTP only on purpose: TLS ports (443, 8443, 465, 993,
+# 995, ...) are never probed in plaintext.
+_HTTP_PORTS = {80, 8000, 8080, 8888, 9000}
+
+# Timeout for the single retry of a silent (filtered) port.
+RETRY_TIMEOUT = 2.0
+
+# Ports risky to expose, with the reason quoted in the output.
+RISKY_REASONS: Dict[int, str] = {
+    21: "FTP sends logins and files unencrypted, and old FTP servers are a favourite brute-force target.",
+    23: "Telnet is fully unencrypted -- anyone on the path can read passwords and sessions.",
+    135: "MS-RPC exposes Windows service internals that worms and lateral-movement tools have abused for years.",
+    139: "NetBIOS session service is part of the legacy SMB stack attackers probe for shares and exploits.",
+    445: "SMB is a top ransomware and worm target (EternalBlue/WannaCry spread over this port).",
+    514: "The rsh/rlogin family trusts hosts instead of passwords and is long past safe use on open networks.",
+    2375: "The Docker engine API on this port is unauthenticated -- exposing it hands out root-level control of the host.",
+    3389: "RDP is one of the most brute-forced and exploited remote-access services on the internet.",
+    5900: "VNC remote desktop is frequently brute-forced and some VNC versions have weak authentication.",
+    6379: "Redis ships with no authentication by default and is often found wide open.",
+    9200: "Elasticsearch on this port is frequently left unauthenticated and has leaked many databases.",
+    27017: "MongoDB instances exposed here have a long history of being ransomed because no login was set.",
+}
+RISKY_PORTS = set(RISKY_REASONS)
+
+# The Quick profile: the previous version's 25 ports, unchanged. The
+# original's 11 ports (21, 22, 23, 25, 53, 80, 135, 139, 443, 445,
+# 3389) are all still in there.
 COMMON_PORTS: Dict[int, str] = {
     21: "FTP",
     22: "SSH",
@@ -82,8 +121,203 @@ COMMON_PORTS: Dict[int, str] = {
     8443: "HTTPS-Alt",
 }
 
-# Ports where a plain HTTP HEAD probe is a reasonable banner request.
-_HTTP_PORTS = {80, 8000, 8080}
+SERVICE_NAMES: Dict[int, str] = {
+    1: "TCPMUX", 7: "Echo", 9: "Discard", 13: "Daytime",
+    17: "QOTD", 19: "Chargen", 20: "FTP-Data", 21: "FTP",
+    22: "SSH", 23: "Telnet", 25: "SMTP", 26: "RSFTP",
+    37: "Time", 42: "WINS-Replication", 43: "WHOIS", 49: "TACACS",
+    53: "DNS", 67: "DHCP-Server", 68: "DHCP-Client", 69: "TFTP",
+    70: "Gopher", 79: "Finger", 80: "HTTP", 81: "HTTP-Alt",
+    82: "XFER", 88: "Kerberos", 101: "HOSTNAME", 102: "ISO-TSAP",
+    105: "CSNET-NS", 107: "RTelnet", 109: "POP2", 110: "POP3",
+    111: "RPCbind", 113: "Ident", 115: "SFTP", 117: "UUCP-Path",
+    119: "NNTP", 123: "NTP", 135: "MS-RPC", 137: "NetBIOS-NS",
+    139: "NetBIOS", 143: "IMAP", 161: "SNMP", 179: "BGP",
+    389: "LDAP", 427: "SLP", 443: "HTTPS", 445: "SMB",
+    465: "SMTPS", 500: "ISAKMP", 512: "Exec", 513: "Login",
+    514: "RSH/Syslog", 515: "LPD", 520: "RIP", 548: "AFP",
+    554: "RTSP", 563: "NNTPS", 587: "SMTP Submission", 591: "HTTP-Alt",
+    593: "MS-RPC-HTTP", 623: "IPMI", 631: "IPP/CUPS", 636: "LDAPS",
+    646: "LDP", 749: "Kerberos-Adm", 800: "HTTP-Alt", 830: "NETCONF-SSH",
+    843: "Adobe-Flash", 853: "DNS-over-TLS", 873: "Rsync", 886: "ICLP",
+    900: "OMG-InitialRefs", 901: "Samba-SWAT", 902: "VMware-Server", 903: "VMware-Remote",
+    989: "FTPS-Data", 990: "FTPS", 992: "TelnetS", 993: "IMAPS",
+    994: "IRCS", 995: "POP3S", 1025: "NFS/RPC", 1026: "Windows-RPC",
+    1027: "Windows-RPC", 1028: "Windows-RPC", 1029: "MS-RPC", 1080: "SOCKS",
+    1083: "Anasoft-License", 1085: "WebObjects", 1098: "RMI-Activation", 1099: "RMI-Registry",
+    1109: "KPOP", 1113: "LTP", 1194: "OpenVPN", 1214: "Kazaa",
+    1241: "Nessus", 1311: "Dell-OpenManage", 1352: "Lotus-Domino", 1433: "MSSQL",
+    1434: "MSSQL-Monitor", 1494: "Citrix-ICA", 1521: "Oracle-DB", 1524: "Ingreslock",
+    1604: "Citrix-MetaFrame", 1720: "H.323", 1723: "PPTP", 1755: "MMS",
+    1801: "MSMQ", 1812: "RADIUS", 1813: "RADIUS-Acct", 1863: "MSNP",
+    1883: "MQTT", 1900: "UPnP/SSDP", 1935: "RTMP", 1984: "BigBrother",
+    2000: "Cisco-SCCP", 2049: "NFS", 2082: "cPanel", 2083: "cPanel-SSL",
+    2086: "WHM", 2087: "WHM-SSL", 2095: "cPanel-Webmail", 2096: "cPanel-Webmail-SSL",
+    2121: "FTP-Proxy", 2181: "ZooKeeper", 2195: "APNS", 2196: "APNS-Feedback",
+    2222: "SSH-Alt/DirectAdmin", 2323: "Telnet-Alt", 2375: "Docker", 2376: "Docker-TLS",
+    2377: "Docker-Swarm", 2379: "etcd-Client", 2380: "etcd-Peer", 2401: "CVS",
+    2427: "MGCP", 2483: "Oracle-SSL", 2484: "Oracle", 2628: "DICT",
+    2638: "Sybase", 3000: "Grafana/Node", 3050: "InterBase", 3127: "Mydoom-Backdoor",
+    3128: "Squid-Proxy", 3260: "iSCSI", 3268: "LDAP-GC", 3269: "LDAP-GC-SSL",
+    3283: "Apple-Remote-Desktop", 3306: "MySQL", 3389: "RDP", 3478: "STUN",
+    3632: "Distcc", 3689: "DAAP", 3690: "SVN", 3784: "Ventrilo",
+    4045: "NFS-Lockd", 4369: "EPMD", 4443: "Pharos", 4444: "KRB524",
+    4500: "IPSec-NAT-T", 4662: "eDonkey", 4672: "eDonkey", 4899: "Radmin",
+    5000: "UPnP/Flask", 5001: "iperf", 5009: "Apple-AirPort", 5050: "Yahoo-Messenger",
+    5060: "SIP", 5061: "SIP-TLS", 5190: "AOL", 5201: "iperf3",
+    5222: "XMPP-Client", 5223: "APNS-Jabber", 5228: "Google-Play", 5269: "XMPP-Server",
+    5280: "XMPP-BOSH", 5353: "mDNS", 5355: "LLMNR", 5432: "PostgreSQL",
+    5500: "VNC", 5555: "Freeciv/ADB", 5601: "Kibana", 5631: "pcAnywhere-Data",
+    5632: "pcAnywhere-Host", 5666: "NRPE", 5671: "AMQP-TLS", 5672: "AMQP",
+    5683: "CoAP", 5800: "VNC-HTTP", 5900: "VNC", 5901: "VNC-1",
+    5902: "VNC-2", 5984: "CouchDB", 5985: "WinRM-HTTP", 5986: "WinRM-HTTPS",
+    5988: "WBEM-HTTP", 5989: "WBEM-HTTPS", 6000: "X11", 6001: "X11",
+    6002: "X11", 6112: "Battle.net", 6129: "DameWare", 6346: "Gnutella",
+    6379: "Redis", 6660: "IRC", 6661: "IRC", 6662: "IRC",
+    6663: "IRC", 6664: "IRC", 6665: "IRC", 6666: "IRC",
+    6667: "IRC", 6668: "IRC", 6669: "IRC", 6697: "IRC-TLS",
+    6881: "BitTorrent", 6969: "BitTorrent-Tracker", 7070: "RealServer", 7777: "Game-Server",
+    8000: "HTTP-Alt", 8001: "HTTP-Alt", 8005: "Tomcat-Remote", 8008: "HTTP-Alt",
+    8009: "AJP13", 8010: "HTTP-Alt", 8022: "SSH-Alt", 8025: "SMTP-Alt",
+    8080: "HTTP-Proxy/Alt", 8081: "HTTP-Alt", 8082: "HTTP-Alt", 8086: "HELM",
+    8087: "HTTP-Alt", 8088: "HTTP-Alt", 8090: "HTTP-Alt", 8091: "HTTP-Alt",
+    8118: "Privoxy", 8123: "Polipo", 8140: "Puppet", 8181: "HTTP-Alt",
+    8333: "Bitcoin", 8443: "HTTPS-Alt", 8500: "HTTP-Alt", 8880: "HTTP-Alt",
+    8883: "MQTT-TLS", 8887: "HTTP-Alt", 8888: "HTTP-Alt", 8983: "Solr",
+    9000: "HTTP-Alt", 9001: "HTTP-Alt", 9002: "HTTP-Alt", 9003: "HTTP-Alt",
+    9006: "HTTP-Alt", 9007: "HTTP-Alt", 9008: "HTTP-Alt", 9009: "HTTP-Alt",
+    9010: "HTTP-Alt", 9080: "HTTP-Alt", 9081: "HTTP-Alt", 9090: "HTTP-Alt",
+    9091: "HTTP-Alt", 9100: "JetDirect", 9150: "Tor", 9200: "Elasticsearch",
+    9300: "Elasticsearch-Cluster", 9333: "Litecoin", 9390: "OpenVAS", 9418: "Git",
+    9443: "HTTPS-Alt", 9999: "HTTP-Alt", 10000: "Webmin", 10025: "SMTP-Alt",
+    10080: "Amanda", 10250: "Kubelet", 10255: "Kubelet-RO", 11211: "Memcached",
+    11371: "PGP-Keyserver", 11434: "Ollama", 16379: "Redis-Cluster", 17500: "Dropbox-LAN",
+    25565: "Minecraft", 27015: "Source-Engine", 27017: "MongoDB", 27018: "MongoDB-Shard",
+    31337: "BackOrifice",
+}
+
+STANDARD_PORTS = [
+    7, 9, 13, 21, 22, 23, 25, 37, 42, 43,
+    49, 53, 69, 70, 79, 80, 88, 101, 102, 110,
+    111, 113, 119, 123, 135, 137, 139, 143, 161, 179,
+    389, 427, 443, 445, 465, 500, 512, 513, 515, 548,
+    554, 563, 587, 593, 631, 636, 749, 800, 853, 873,
+    989, 990, 993, 995, 1025, 1080, 1099, 1194, 1241, 1311,
+    1352, 1433, 1434, 1494, 1521, 1720, 1723, 1900, 1935, 2000,
+    2049, 2082, 2083, 2086, 2095, 2222, 2375, 2379, 3000, 3306,
+    3389, 5060, 5222, 5269, 5353, 5432, 5601, 5672, 5900, 5985,
+    6000, 6379, 8000, 8009, 8080, 8081, 8443, 8888, 9090, 9200,
+]
+
+DEEP_PORTS = [
+    1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+    11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+    21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
+    31, 32, 33, 34, 35, 36, 37, 38, 39, 40,
+    41, 42, 43, 44, 45, 46, 47, 48, 49, 50,
+    51, 52, 53, 54, 55, 56, 57, 58, 59, 60,
+    61, 62, 63, 64, 65, 66, 67, 68, 69, 70,
+    71, 72, 73, 74, 75, 76, 77, 78, 79, 80,
+    81, 82, 83, 84, 85, 86, 87, 88, 89, 90,
+    91, 92, 93, 94, 95, 96, 97, 98, 99, 100,
+    101, 102, 103, 104, 105, 106, 107, 108, 109, 110,
+    111, 112, 113, 114, 115, 116, 117, 118, 119, 120,
+    121, 122, 123, 124, 125, 126, 127, 128, 129, 130,
+    131, 132, 133, 134, 135, 136, 137, 138, 139, 140,
+    141, 142, 143, 144, 145, 146, 147, 148, 149, 150,
+    151, 152, 153, 154, 155, 156, 157, 158, 159, 160,
+    161, 162, 163, 164, 165, 166, 167, 168, 169, 170,
+    171, 172, 173, 174, 175, 176, 177, 178, 179, 180,
+    181, 182, 183, 184, 185, 186, 187, 188, 189, 190,
+    191, 192, 193, 194, 195, 196, 197, 198, 199, 200,
+    201, 202, 203, 204, 205, 206, 207, 208, 209, 210,
+    211, 212, 213, 214, 215, 216, 217, 218, 219, 220,
+    221, 222, 223, 224, 225, 226, 227, 228, 229, 230,
+    231, 232, 233, 234, 235, 236, 237, 238, 239, 240,
+    241, 242, 243, 244, 245, 246, 247, 248, 249, 250,
+    251, 252, 253, 254, 255, 256, 257, 258, 259, 260,
+    261, 262, 263, 264, 265, 266, 267, 268, 269, 270,
+    271, 272, 273, 274, 275, 276, 277, 278, 279, 280,
+    281, 282, 283, 284, 285, 286, 287, 288, 289, 290,
+    291, 292, 293, 294, 295, 296, 297, 298, 299, 300,
+    301, 302, 303, 304, 305, 306, 307, 308, 309, 310,
+    311, 312, 313, 314, 315, 316, 317, 318, 319, 320,
+    321, 322, 323, 324, 325, 326, 327, 328, 329, 330,
+    331, 332, 333, 334, 335, 336, 337, 338, 339, 340,
+    341, 342, 343, 344, 345, 346, 347, 348, 349, 350,
+    351, 352, 353, 354, 355, 356, 357, 358, 359, 360,
+    361, 362, 363, 364, 365, 366, 367, 368, 369, 370,
+    371, 372, 373, 374, 375, 376, 377, 378, 379, 380,
+    381, 382, 383, 384, 385, 386, 387, 388, 389, 390,
+    391, 392, 393, 394, 395, 396, 397, 398, 399, 400,
+    401, 402, 403, 404, 405, 406, 407, 408, 409, 410,
+    411, 412, 413, 414, 415, 416, 417, 418, 419, 420,
+    421, 422, 423, 424, 425, 426, 427, 428, 429, 430,
+    431, 432, 433, 434, 435, 436, 437, 438, 439, 440,
+    441, 442, 443, 444, 445, 446, 447, 448, 449, 450,
+    451, 452, 453, 454, 455, 456, 457, 458, 459, 460,
+    461, 462, 463, 464, 465, 466, 467, 468, 469, 470,
+    471, 472, 473, 474, 475, 476, 477, 478, 479, 480,
+    481, 482, 483, 484, 485, 486, 487, 488, 489, 490,
+    491, 492, 493, 494, 495, 496, 497, 498, 499, 500,
+    501, 502, 503, 504, 505, 506, 507, 508, 509, 510,
+    511, 512, 513, 514, 515, 516, 517, 518, 519, 520,
+    521, 522, 523, 524, 525, 526, 527, 528, 529, 530,
+    531, 532, 533, 534, 535, 536, 537, 538, 539, 540,
+    541, 542, 543, 544, 545, 546, 547, 548, 549, 550,
+    551, 552, 553, 554, 555, 556, 557, 558, 559, 560,
+    561, 562, 563, 564, 565, 566, 567, 568, 569, 570,
+    571, 572, 573, 574, 575, 576, 577, 578, 579, 580,
+    581, 582, 583, 584, 585, 586, 587, 588, 589, 590,
+    591, 592, 593, 594, 595, 596, 597, 598, 599, 600,
+    601, 602, 603, 604, 605, 606, 607, 608, 609, 610,
+    611, 612, 613, 614, 615, 616, 617, 618, 619, 620,
+    621, 622, 623, 624, 625, 626, 627, 628, 629, 630,
+    631, 632, 633, 634, 635, 636, 637, 638, 639, 640,
+    641, 642, 643, 644, 645, 646, 647, 648, 649, 650,
+    651, 652, 653, 654, 655, 656, 657, 658, 659, 660,
+    661, 662, 663, 664, 665, 666, 667, 668, 669, 670,
+    671, 672, 673, 674, 675, 676, 677, 678, 679, 680,
+    681, 682, 683, 684, 685, 686, 687, 688, 689, 690,
+    691, 692, 693, 694, 695, 696, 697, 698, 699, 700,
+    701, 702, 703, 704, 705, 706, 707, 708, 709, 710,
+    711, 712, 713, 714, 715, 716, 717, 718, 719, 720,
+    721, 722, 723, 724, 725, 726, 727, 728, 729, 730,
+    731, 732, 733, 734, 735, 736, 737, 738, 739, 740,
+    741, 742, 743, 744, 745, 746, 747, 748, 749, 750,
+    751, 752, 753, 754, 755, 756, 757, 758, 759, 760,
+    761, 762, 763, 764, 765, 766, 767, 768, 769, 770,
+    771, 772, 773, 774, 775, 776, 777, 778, 779, 780,
+    781, 800, 830, 843, 853, 873, 886, 900, 901, 902,
+    903, 989, 990, 992, 993, 994, 995, 1025, 1026, 1027,
+    1028, 1029, 1080, 1083, 1085, 1098, 1099, 1109, 1113, 1194,
+    1214, 1241, 1311, 1352, 1433, 1434, 1494, 1521, 1524, 1604,
+    1720, 1723, 1755, 1801, 1812, 1813, 1863, 1883, 1900, 1935,
+    1984, 2000, 2049, 2082, 2083, 2086, 2087, 2095, 2096, 2121,
+    2181, 2195, 2196, 2222, 2323, 2375, 2376, 2377, 2379, 2380,
+    2401, 2427, 2483, 2484, 2628, 2638, 3000, 3050, 3127, 3128,
+    3260, 3268, 3269, 3283, 3306, 3389, 3478, 3632, 3689, 3690,
+    3784, 4045, 4369, 4443, 4444, 4500, 4662, 4672, 4899, 5000,
+    5001, 5009, 5050, 5060, 5061, 5190, 5201, 5222, 5223, 5228,
+    5269, 5280, 5353, 5355, 5432, 5500, 5555, 5601, 5631, 5632,
+    5666, 5671, 5672, 5683, 5800, 5900, 5901, 5902, 5984, 5985,
+    5986, 5988, 5989, 6000, 6001, 6002, 6112, 6129, 6346, 6379,
+    6660, 6661, 6662, 6663, 6664, 6665, 6666, 6667, 6668, 6669,
+    6697, 6881, 6969, 7070, 7777, 8000, 8001, 8005, 8008, 8009,
+    8010, 8022, 8025, 8080, 8081, 8082, 8086, 8087, 8088, 8090,
+    8091, 8118, 8123, 8140, 8181, 8333, 8443, 8500, 8880, 8883,
+    8887, 8888, 8983, 9000, 9001, 9002, 9003, 9006, 9007, 9008,
+    9009, 9010, 9080, 9081, 9090, 9091, 9100, 9150, 9200, 9300,
+    9333, 9390, 9418, 9443, 9999, 10000, 10025, 10080, 10250, 10255,
+    11211, 11371, 11434, 16379, 17500, 25565, 27015, 27017, 27018, 31337,
+]
+
+
+PROFILES: Dict[str, List[int]] = {
+    "quick": sorted(COMMON_PORTS),
+    "standard": STANDARD_PORTS,
+    "deep": DEEP_PORTS,
+}
 
 
 @dataclass
@@ -92,6 +326,8 @@ class ScanResult:
     service: str
     status: str  # "open" | "closed" | "filtered"
     banner: str = ""
+    latency_ms: float = 0.0
+    retried: bool = False
 
 
 def validate_target(raw: str) -> tuple:
@@ -145,27 +381,54 @@ def _grab_banner(sock: socket.socket, port: int) -> str:
         return ""
 
 
+def _connect_once(ip: str, port: int, timeout: float) -> tuple:
+    """One connect attempt: (outcome, latency_ms, open_sock_or_None)."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    start = time.perf_counter()
+    try:
+        result = sock.connect_ex((ip, port))
+        latency = (time.perf_counter() - start) * 1000.0
+    except (socket.timeout, TimeoutError, OSError):
+        sock.close()
+        return "no-reply", (time.perf_counter() - start) * 1000.0, None
+    if result == 0:
+        return "open", latency, sock
+    sock.close()
+    if result == errno.ECONNREFUSED:
+        return "closed", latency, None
+    return "no-reply", latency, None
+
+
 def scan_port(
     ip: str, port: int, timeout: float = 1.0, banner: bool = False
 ) -> ScanResult:
-    """Connect-scan one port; classify it open / closed / filtered."""
-    service = COMMON_PORTS.get(port, "unknown")
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(timeout)
+    """Connect-scan one port; classify it open / closed / filtered.
+
+    A first-pass "no reply" is retried once at RETRY_TIMEOUT seconds
+    before the port is called filtered.
+    """
+    service = SERVICE_NAMES.get(port, "unknown")
+    outcome, latency, sock = _connect_once(ip, port, timeout)
+    retried = False
+    if outcome == "no-reply":
+        retried = True
+        outcome, latency, sock = _connect_once(ip, port, RETRY_TIMEOUT)
     try:
-        result = sock.connect_ex((ip, port))
-        if result == 0:
+        if outcome == "open" and sock is not None:
             grabbed = _grab_banner(sock, port) if banner else ""
-            return ScanResult(port=port, service=service, status="open", banner=grabbed)
-        if result == errno.ECONNREFUSED:
-            return ScanResult(port=port, service=service, status="closed")
-        return ScanResult(port=port, service=service, status="filtered")
-    except (socket.timeout, TimeoutError):
-        return ScanResult(port=port, service=service, status="filtered")
-    except OSError:
-        return ScanResult(port=port, service=service, status="filtered")
+            return ScanResult(
+                port=port, service=service, status="open", banner=grabbed,
+                latency_ms=round(latency, 1), retried=retried,
+            )
+        status = "closed" if outcome == "closed" else "filtered"
+        return ScanResult(
+            port=port, service=service, status=status,
+            latency_ms=round(latency, 1), retried=retried,
+        )
     finally:
-        sock.close()
+        if sock is not None:
+            sock.close()
 
 
 def scan_host(
@@ -174,10 +437,18 @@ def scan_host(
     timeout: float = 1.0,
     banner: bool = False,
     workers: int = 32,
+    profile: str = "quick",
 ) -> tuple:
     """Scan one host. Returns ``(ip, display_name, results sorted by port)``."""
     ip, display = validate_target(target)
-    port_list = sorted(set(ports)) if ports is not None else sorted(COMMON_PORTS)
+    if ports is not None:
+        port_list = sorted(set(ports))
+    else:
+        key = (profile or "quick").strip().lower()
+        if key not in PROFILES:
+            valid = ", ".join(sorted(PROFILES))
+            raise ValueError(f"Unknown profile '{profile}'. Choose one of: {valid}.")
+        port_list = list(PROFILES[key])
     results: List[ScanResult] = []
 
     def _job(p: int) -> ScanResult:
@@ -194,6 +465,12 @@ def scan_host(
     return ip, display, results
 
 
+_USAGE = (
+    "Usage: port_scanner [target] [--banner] [--timeout SECONDS] "
+    "[--profile quick|standard|deep]"
+)
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     banner = "--banner" in argv
@@ -205,10 +482,19 @@ def main(argv: Optional[List[str]] = None) -> int:
             timeout = float(argv[idx + 1])
             del argv[idx : idx + 2]
         except (IndexError, ValueError):
-            print("Usage: port_scanner [target] [--banner] [--timeout SECONDS]")
+            print(_USAGE)
+            return 2
+    profile = "quick"
+    if "--profile" in argv:
+        idx = argv.index("--profile")
+        try:
+            profile = argv[idx + 1]
+            del argv[idx : idx + 2]
+        except IndexError:
+            print(_USAGE)
             return 2
     if any(a.startswith("--") for a in argv) or len(argv) > 1:
-        print("Usage: port_scanner [target] [--banner] [--timeout SECONDS]")
+        print(_USAGE)
         return 2
 
     print("QuantumCat port scanner -- a learning tool for your own machines.")
@@ -222,28 +508,35 @@ def main(argv: Optional[List[str]] = None) -> int:
             print("\nNo target given -- nothing to scan.")
             return 1
 
+    started = time.perf_counter()
     try:
-        ip, display, results = scan_host(target, timeout=timeout, banner=banner)
+        ip, display, results = scan_host(
+            target, timeout=timeout, banner=banner, profile=profile)
     except ValueError as exc:
         print(f"\n[!] {exc}")
         return 1
+    duration = time.perf_counter() - started
 
     shown = display if display == ip else f"{display} ({ip})"
-    print(f"\n[+] Scanning {shown} -- {len(results)} ports\n")
+    print(f"\n[+] Scanning {shown} -- {len(results)} ports "
+          f"(profile: {profile})\n")
 
     counts = {"open": 0, "closed": 0, "filtered": 0}
     for r in results:
         counts[r.status] += 1
+        timing = f"({r.latency_ms:.0f} ms" + (", after retry)" if r.retried else ")")
         if r.status == "open":
-            line = f"[OPEN]     Port {r.port:<5} {r.service}"
+            line = f"[OPEN]     Port {r.port:<5} {r.service}  {timing}"
             if r.banner:
                 line += f"  -- {r.banner}"
             print(line)
+            if r.port in RISKY_REASONS:
+                print(f"           [!] Risky if exposed: {RISKY_REASONS[r.port]}")
         else:
-            print(f"[{r.status.upper():<8}] Port {r.port:<5} {r.service}")
+            print(f"[{r.status.upper():<8}] Port {r.port:<5} {r.service}  {timing}")
 
     print(
-        f"\n[+] Scan complete: {counts['open']} open, "
+        f"\n[+] Scan complete in {duration:.1f}s: {counts['open']} open, "
         f"{counts['closed']} closed, {counts['filtered']} filtered."
     )
     return 0
