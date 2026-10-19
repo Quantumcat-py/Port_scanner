@@ -6,34 +6,59 @@ teaching myself networking and cybersecurity.
 ## What it does
 
 Run it, type in an IP address or hostname, and it does a TCP connect
-scan over 25 well-known ports, printing each port's service name and
-whether it's **open**, **closed**, or **filtered**. Standard library
-only — no dependencies. You can still read the whole thing in one
-sitting, which makes it a decent learning artifact.
+scan, printing each port's service name, whether it's **open**,
+**closed**, or **filtered**, and how long the answer took. Three scan
+profiles: **quick** (25 well-known ports), **standard** (top 100), and
+**deep** (top 1000), backed by a service-name table of about 285
+entries. Standard library only — no dependencies. Still readable in
+one sitting, which makes it a decent learning artifact.
 
 ```bash
-python3 port_scanner            # it asks for a target
-python3 port_scanner 127.0.0.1  # or give it one directly
-python3 port_scanner 127.0.0.1 --banner   # also grab service banners
+python3 Port_scanner                     # it asks for a target (quick profile)
+python3 Port_scanner 127.0.0.1           # or give it one directly
+python3 Port_scanner 127.0.0.1 --banner  # also grab service banners
+python3 Port_scanner 127.0.0.1 --profile standard   # top 100 ports
+python3 Port_scanner 127.0.0.1 --profile deep       # top 1000 ports
 ```
 
 **Only scan machines you own or have explicit permission to test.**
 Start with `127.0.0.1` — your own machine is the intended target.
 
+## v1.2 — October 2026
+
+This script is being updated in step with the QuantumCat SOC Toolkit's
+v1.2 update, rolling out this week. What changed this round:
+
+- **Scan profiles.** Quick 25 / standard 100 / deep 1000 instead of
+  one fixed list of 25, with service names for everything scanned.
+- **"Filtered" has to be earned now.** A port that doesn't answer
+  gets one retry at a longer timeout before it's labelled filtered.
+  The old single quick pass could mislabel slow or firewalled
+  services; a refusal (closed) still answers instantly and never
+  retries.
+- **Per-port latency.** Every result shows how long the port took to
+  answer, in milliseconds — fast-refused and slow-refused are
+  different stories, and now you can see which one you're looking at.
+- **Risky-port callouts.** When an open port is one that's commonly
+  abused (FTP, Telnet, SMB, RDP, VNC, Redis, Docker, MongoDB, and
+  friends — 12 in total), the output says so, with a plain-English
+  reason under the result.
+- **Wider banner set.** `--banner` now also probes the extra web-alt
+  ports (8888, 9000). TLS ports are never sent a plaintext probe.
+
 ## Updated
 
 The original (May 2026) was about 25 lines: sequential, 11 ports,
-open ports only. It worked, but it was slow and it only told a third of
-the story. This version keeps the same simple idea and fixes that:
+open ports only. It worked, but it was slow and it only told a third
+of the story. This version keeps the same simple idea and fixes that:
 
 - **Threaded.** Up to 32 workers instead of one port at a time — a
   firewalled host no longer costs a full second per port, serially.
-- **25 well-known ports with service names**, not just the original 11.
 - **Open / closed / filtered as three distinct states.** The original
   only reported *open*; closed and filtered were both just silence,
   even though those are different answers in reality.
-- **Optional passive banner grab** (`--banner`) — it reads the banner a
-  service volunteers, nothing more aggressive than that.
+- **Optional passive banner grab** (`--banner`) — it reads the banner
+  a service volunteers, nothing more aggressive than that.
 - **Friendly input validation** instead of tracebacks: empty targets,
   unresolvable hostnames, and CIDR ranges get a plain-English
   explanation of what to enter instead.
