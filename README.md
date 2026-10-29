@@ -3,6 +3,12 @@
 A tiny Python port scanner — one of the first things I wrote while
 teaching myself networking and cybersecurity.
 
+> **Note:** this is a standalone script update, not the app update.
+> The packaged QuantumCat SOC Toolkit update ships only when all
+> three of its tools have something new to add — until then, the
+> app on Gumroad is still the previous version, and this script is
+> the preview of what's coming.
+
 ## What it does
 
 Run it, type in an IP address or hostname, and it does a TCP connect
@@ -26,8 +32,10 @@ Start with `127.0.0.1` — your own machine is the intended target.
 
 ## v1.2 — October 2026
 
-This script is being updated in step with the QuantumCat SOC Toolkit's
-v1.2 update, rolling out this week. What changed this round:
+This script is updated ahead of the QuantumCat SOC Toolkit's v1.2
+app update. The app update itself is not live yet — it ships only
+when all three tools have something new to add. What changed in
+this script this round:
 
 - **Scan profiles.** Quick 25 / standard 100 / deep 1000 instead of
   one fixed list of 25, with service names for everything scanned.
